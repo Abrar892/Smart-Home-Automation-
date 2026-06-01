@@ -1,0 +1,575 @@
+#define BLYNK_TEMPLATE_ID "TMPL6nJaCChZL"
+#define BLYNK_TEMPLATE_NAME "Ultrasonic Sensor"
+#define BLYNK_AUTH_TOKEN "VJffHoOIhtAN_nPe4hTYLxI_Yh_3MI_P"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "lab";
+char pass[] = "11111111";
+
+// ================= PINS =================
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define RELAY_PIN 23
+#define BUZZER_PIN 4
+
+#define L1 13
+#define L2 12
+#define L3 14
+#define L4 27
+
+#define F1 26
+#define F2 25
+#define F3 33
+#define F4 32
+
+// ================= TANK CALIBRATION =================
+
+// SENSOR AT TOP OF TANK
+// FULL TANK  -> SMALL DISTANCE
+// EMPTY TANK -> LARGE DISTANCE
+
+float FULL_DISTANCE  = 2.0;   // Tank FULL = 100%
+float EMPTY_DISTANCE = 8.5;   // Tank EMPTY = 0%
+
+// ================= THRESHOLDS =================
+
+float MOTOR_STOP_LEVEL  = 80.0;
+float MOTOR_START_LEVEL = 75.0;
+
+float LOW_LEVEL_ALERT  = 20.0;
+float HIGH_LEVEL_ALERT = 80.0;
+
+// ================= STATES =================
+
+bool motorState = false;
+bool motorLocked = false;
+
+bool highAlertSent = false;
+bool lowAlertSent = false;
+
+bool discoMode = false;
+
+bool manualOverride = false;
+
+unsigned long lastManualTime = 0;
+
+float lastValidDistance = 5.0;
+float lastStablePercentage = 0.0;
+
+BlynkTimer timer;
+
+// ====================================================
+// FILTERED DISTANCE
+// ====================================================
+
+float getFilteredDistance() {
+
+  float readings[5];
+  int validCount = 0;
+
+  for (int i = 0; i < 5; i++) {
+
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, 15000);
+
+    if (duration == 0) {
+      continue;
+    }
+
+    float distance = duration * 0.034 / 2.0;
+
+    if (distance >= 1.0 && distance <= 50.0) {
+      readings[validCount] = distance;
+      validCount++;
+    }
+
+    delay(30);
+  }
+
+  // If sensor failed
+  if (validCount == 0) {
+    Serial.println("❌ Sensor Error! Using last valid value");
+    return lastValidDistance;
+  }
+
+  // Average readings
+  float total = 0;
+
+  for (int i = 0; i < validCount; i++) {
+    total += readings[i];
+  }
+
+  float average = total / validCount;
+
+  // Limit sudden jumps
+  float maxChange = 2.0;
+
+  if (abs(average - lastValidDistance) > maxChange) {
+
+    if (average > lastValidDistance) {
+      average = lastValidDistance + maxChange;
+    }
+    else {
+      average = lastValidDistance - maxChange;
+    }
+  }
+
+  lastValidDistance = average;
+
+  return average;
+}
+
+// ====================================================
+// WATER LEVEL PERCENTAGE
+// ====================================================
+
+float calculateWaterLevelPercentage(float distance) {
+
+  // Clamp values
+
+  if (distance < FULL_DISTANCE) {
+    distance = FULL_DISTANCE;
+  }
+
+  if (distance > EMPTY_DISTANCE) {
+    distance = EMPTY_DISTANCE;
+  }
+
+  // Correct formula
+
+  float percentage =
+    ((EMPTY_DISTANCE - distance) /
+    (EMPTY_DISTANCE - FULL_DISTANCE)) * 100.0;
+
+  percentage = constrain(percentage, 0, 100);
+
+  return percentage;
+}
+
+// ====================================================
+// MOTOR CONTROL
+// ====================================================
+
+void setMotor(bool state, String source = "Auto") {
+
+  if (motorState == state) return;
+
+  motorState = state;
+
+  if (state) {
+
+    digitalWrite(RELAY_PIN, HIGH);
+
+    Serial.println("🟢 MOTOR ON");
+
+  } else {
+
+    digitalWrite(RELAY_PIN, LOW);
+
+    Serial.println("🔴 MOTOR OFF");
+  }
+
+  Blynk.virtualWrite(V2, state);
+
+  Serial.print("Source: ");
+  Serial.println(source);
+}
+
+// ====================================================
+// BUZZER
+// ====================================================
+
+void buzzerAlert(int type) {
+
+  if (type == 1) {
+
+    for (int i = 0; i < 3; i++) {
+
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(100);
+
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(100);
+    }
+  }
+
+  else if (type == 2) {
+
+    for (int i = 0; i < 2; i++) {
+
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(300);
+
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(300);
+    }
+  }
+}
+
+// ====================================================
+// BLYNK MOTOR CONTROL
+// ====================================================
+
+BLYNK_WRITE(V2) {
+
+  int value = param.asInt();
+
+  lastManualTime = millis();
+  manualOverride = true;
+
+  // MANUAL ON
+
+  if (value == 1) {
+
+    if (motorLocked) {
+
+      Serial.println("❌ Motor LOCKED");
+
+      Blynk.virtualWrite(V2, 0);
+
+      return;
+    }
+
+    setMotor(true, "Manual");
+  }
+
+  // MANUAL OFF
+
+  else {
+
+    setMotor(false, "Manual");
+  }
+}
+
+// ====================================================
+// LIGHTS
+// ====================================================
+
+BLYNK_WRITE(V3) { digitalWrite(L1, param.asInt()); }
+BLYNK_WRITE(V4) { digitalWrite(L2, param.asInt()); }
+BLYNK_WRITE(V5) { digitalWrite(L3, param.asInt()); }
+BLYNK_WRITE(V6) { digitalWrite(L4, param.asInt()); }
+
+BLYNK_WRITE(V7) {
+
+  int s = param.asInt();
+
+  digitalWrite(L1, s);
+  digitalWrite(L2, s);
+  digitalWrite(L3, s);
+  digitalWrite(L4, s);
+}
+
+// ====================================================
+// FANS
+// ====================================================
+
+BLYNK_WRITE(V8)  { digitalWrite(F1, param.asInt()); }
+BLYNK_WRITE(V9)  { digitalWrite(F2, param.asInt()); }
+BLYNK_WRITE(V10) { digitalWrite(F3, param.asInt()); }
+BLYNK_WRITE(V11) { digitalWrite(F4, param.asInt()); }
+
+BLYNK_WRITE(V12) {
+
+  int s = param.asInt();
+
+  digitalWrite(F1, s);
+  digitalWrite(F2, s);
+  digitalWrite(F3, s);
+  digitalWrite(F4, s);
+}
+
+// ====================================================
+// DISCO MODE
+// ====================================================
+
+BLYNK_WRITE(V13) {
+  discoMode = param.asInt();
+}
+
+void discoLights() {
+
+  if (!discoMode) return;
+
+  digitalWrite(L1, random(0, 2));
+  digitalWrite(L2, random(0, 2));
+  digitalWrite(L3, random(0, 2));
+  digitalWrite(L4, random(0, 2));
+}
+
+// ====================================================
+// MAIN SENSOR FUNCTION
+// ====================================================
+
+void sendSensorData() {
+
+  // Get ONE reading only
+
+  float rawDistance = getFilteredDistance();
+
+  // Sensor fail protection
+
+  if (rawDistance <= 0 || rawDistance > 50) {
+
+    Serial.println("❌ Invalid Sensor Reading");
+
+    setMotor(false, "Sensor Fail");
+
+    return;
+  }
+
+  // Calculate %
+
+  float percentage =
+    calculateWaterLevelPercentage(rawDistance);
+
+  // Smooth %
+
+  percentage =
+    (0.7 * lastStablePercentage) +
+    (0.3 * percentage);
+
+  lastStablePercentage = percentage;
+
+  // Send to Blynk
+
+  Blynk.virtualWrite(V0, rawDistance);
+  Blynk.virtualWrite(V1, percentage);
+
+  // SERIAL DEBUG
+
+  Serial.println("================================");
+
+  Serial.print("📏 Distance: ");
+  Serial.print(rawDistance);
+  Serial.println(" cm");
+
+  Serial.print("💧 Water Level: ");
+  Serial.print(percentage);
+  Serial.println("%");
+
+  // ====================================================
+  // ALERTS
+  // ====================================================
+
+  // HIGH ALERT
+
+  if (percentage >= HIGH_LEVEL_ALERT && !highAlertSent) {
+
+    highAlertSent = true;
+
+    buzzerAlert(1);
+
+    Serial.println("⚠️ HIGH WATER LEVEL");
+
+    Blynk.logEvent(
+      "high_water_alert",
+      "Tank reached 80%"
+    );
+  }
+
+  else if (percentage < HIGH_LEVEL_ALERT) {
+
+    highAlertSent = false;
+  }
+
+  // LOW ALERT
+
+  if (percentage <= LOW_LEVEL_ALERT && !lowAlertSent) {
+
+    lowAlertSent = true;
+
+    buzzerAlert(2);
+
+    Serial.println("⚠️ LOW WATER LEVEL");
+
+    Blynk.logEvent(
+      "low_water_alert",
+      "Water level low"
+    );
+  }
+
+  else if (percentage > LOW_LEVEL_ALERT) {
+
+    lowAlertSent = false;
+  }
+
+  // ====================================================
+  // MANUAL OVERRIDE TIMEOUT
+  // ====================================================
+
+  if (manualOverride &&
+      millis() - lastManualTime > 30000) {
+
+    manualOverride = false;
+
+    Serial.println("🔄 Auto Mode Restored");
+  }
+
+  // ====================================================
+  // AUTO MOTOR CONTROL
+  // ====================================================
+
+  if (!manualOverride) {
+
+    // STOP MOTOR
+
+    if (percentage >= MOTOR_STOP_LEVEL) {
+
+      if (!motorLocked) {
+
+        setMotor(false, "Tank Full");
+
+        motorLocked = true;
+
+        Serial.println("🔒 Motor Locked");
+      }
+    }
+
+    // START MOTOR
+
+    else if (percentage < MOTOR_START_LEVEL) {
+
+      if (motorLocked) {
+
+        motorLocked = false;
+
+        Serial.println("🔓 Motor Unlocked");
+      }
+
+      if (!motorState) {
+
+        setMotor(true, "Tank Low");
+      }
+    }
+  }
+
+  else {
+
+    Serial.println("👤 Manual Override Active");
+
+    // Update lock only
+
+    if (percentage >= MOTOR_STOP_LEVEL) {
+      motorLocked = true;
+    }
+
+    if (percentage < MOTOR_START_LEVEL) {
+      motorLocked = false;
+    }
+  }
+
+  // STATUS
+
+  Serial.print("Motor: ");
+
+  if (motorState) {
+    Serial.println("ON 🟢");
+  } else {
+    Serial.println("OFF 🔴");
+  }
+
+  Serial.println("================================");
+}
+
+// ====================================================
+// SETUP
+// ====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  Serial.println("");
+  Serial.println("================================");
+  Serial.println(" WATER TANK CONTROLLER SYSTEM ");
+  Serial.println("================================");
+
+  // RELAY SAFETY
+
+  digitalWrite(RELAY_PIN, LOW);
+
+  // PIN MODES
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(RELAY_PIN, OUTPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(L1, OUTPUT);
+  pinMode(L2, OUTPUT);
+  pinMode(L3, OUTPUT);
+  pinMode(L4, OUTPUT);
+
+  pinMode(F1, OUTPUT);
+  pinMode(F2, OUTPUT);
+  pinMode(F3, OUTPUT);
+  pinMode(F4, OUTPUT);
+
+  // INITIAL STATES
+
+  digitalWrite(BUZZER_PIN, LOW);
+
+  digitalWrite(L1, LOW);
+  digitalWrite(L2, LOW);
+  digitalWrite(L3, LOW);
+  digitalWrite(L4, LOW);
+
+  digitalWrite(F1, LOW);
+  digitalWrite(F2, LOW);
+  digitalWrite(F3, LOW);
+  digitalWrite(F4, LOW);
+
+  // Initial reading
+
+  delay(2000);
+
+  float d = getFilteredDistance();
+
+  lastStablePercentage =
+    calculateWaterLevelPercentage(d);
+
+  Serial.print("Initial Distance: ");
+  Serial.println(d);
+
+  Serial.print("Initial Level: ");
+  Serial.print(lastStablePercentage);
+  Serial.println("%");
+
+  // BLYNK
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // TIMERS
+
+  timer.setInterval(2000L, sendSensorData);
+
+  timer.setInterval(300L, discoLights);
+
+  Serial.println("");
+  Serial.println("✅ SYSTEM READY");
+  Serial.println("");
+}
+
+// ====================================================
+// LOOP
+// ====================================================
+
+void loop() {
+
+  Blynk.run();
+
+  timer.run();
+}
